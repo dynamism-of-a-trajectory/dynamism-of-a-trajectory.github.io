@@ -1,0 +1,127 @@
+# Left-gate scene (new sagesplat export under data/gate_scenes_export/left_scene).
+#
+# Frame contract (see src/falsify/geometry/CLAUDE.md for the project-wide rules):
+#   * policy positions    → mocap
+#   * MPC / SplatNav      → ned   (FiGS dynamics convention)
+#   * gsplat rendering    → ns    (nerfstudio-internal, scaled)
+#
+# Mocap here is the JOINT mocap of the gate_scenes_export bundle, which by
+# construction equals the left scene's own mocap (the ICP correction is the
+# identity for left). The same `mocap` frame name therefore refers to the
+# same physical frame across the two gate scenes — making it safe to author
+# start/goal positions once and reuse them between left and right.
+
+scene_key: left_gate
+# Paths are resolved relative to this scene YAML's directory (configs/scenes/),
+# same convention as the transforms' `path:` fields below.
+gsplat_path: ../../data/gate_scenes_export/left_scene/mocap_outputs/sagesplat_mocap/sagesplat/2026-05-11_153901
+gsplat_config_yml: ../../data/gate_scenes_export/left_scene/mocap_outputs/sagesplat_mocap/sagesplat/2026-05-11_153901/config.yml
+# Nerfstudio resolves config.yml's `data: mocap_processed` relative to cwd;
+# launch the gsplat with this directory as cwd (per the export bundle's README).
+gsplat_data_cwd: ../../data/gate_scenes_export/left_scene
+
+# Mission specification — all in MOCAP (joint mocap, z-up, origin at ArUco tag).
+# Left-gate AABB in joint mocap: x∈[0.51, 1.21], y∈[0.27, 1.12], z∈[0.08, 1.97].
+#
+# `start_position_mocap` matches the v7 *training* distribution (every
+# synth_left_gate / synth_right_gate / synth_center_* episode starts at
+# (0, 0, 1.5) ± ~2 cm with yaw=0). The previous "approach from -x at the
+# gate's mean y" value (-0.5, 0.7, 1.5) was an off-distribution evaluation
+# the policy hadn't been trained for. Keep within-distribution by default;
+# use `start_randomization` (below) to sweep a small ball around it, and
+# treat any deliberate off-distribution probe as a *perturbation*, not a
+# default.
+start_position_mocap: [0.00, 0.00, 1.50]
+goal_position_mocap:  [1.525, -0.615, 1.0]   # shared "stuffed animal" hover; matches courses/through_left_gate.yaml hover waypoint
+gate_position_mocap:  [0.86, 0.69, 1.50]
+
+# Optional: random ±half_widths uniform offset on the start position.
+# Half-widths of 5 cm bracket the synth training σ ≈ 2-3 cm.
+start_randomization:
+  half_widths_mocap: [0.05, 0.05, 0.05]
+
+frames:
+  - { name: mocap, notes: "Joint mocap (z-up, origin at ArUco tag, +x along tag printed +y)." }
+  - { name: ned,   notes: "FiGS dynamics frame; related to mocap by inverting y and z (perm5 = diag(1,-1,-1))." }
+  - { name: ns,    notes: "Nerfstudio-internal (dataparser-transformed, scaled) — what the gsplat renderer expects." }
+  - { name: cam_body, notes: "Drone body frame (IMU origin)." }
+  - { name: cam_forward, notes: "Forward-facing camera optical frame (OpenCV: x right, y down, z forward)." }
+  - { name: cam_downward, notes: "Downward-facing camera optical frame (OpenCV)." }
+
+transforms:
+  # MOCAP ↔ NED. legacy "perm5" convention: R_mocap_from_ned = diag(1, -1, -1).
+  # This matches FiGS' built-in Tw2g (render/gsplat.py:29) and the frame the VLA
+  # was trained in, so the renderer and the OpenPI server agree without glue.
+  # Geometrically: mocap is right-handed Z-up; NED is right-handed Z-down with
+  # the same x-axis and a flipped y-axis (the y/z flip together preserve
+  # right-handedness).
+  - { src: ned, dst: mocap, type: se3_inline,
+      R: [[1, 0, 0], [0, -1, 0], [0, 0, -1]],
+      t: [0, 0, 0] }
+
+  # MOCAP → NS via the pre-composed joint_mocap_to_nerf_4x4 in the export bundle.
+  # For the left scene this is just the dataparser; the ICP step is identity.
+  - { src: mocap, dst: ns, type: sim3_matrix_file,
+      path: ../../data/gate_scenes_export/objects_final/joint_mocap_to_nerf.json,
+      json_path: [scenes, left_gate_new, joint_mocap_to_nerf_4x4] }
+
+  # Body → forward camera. Numbers below come from the drone calibration file.s
+  # ``camera_to_body_transform`` interpreted as ``T_body_from_cam``; we
+  # register the inverse ``T_cam_from_body`` here.
+  - { src: cam_body, dst: cam_forward, type: se3_inline,
+      R: [[0, 1, 0], [0, 0, -1], [-1, 0, 0]],
+      t: [0.03, -0.01, 0.10] }
+
+  # Body → downward camera. Maps body axes (FRD: x=forward, y=right, z=down)
+  # to OpenGL camera axes (x=right, y=up, z=backward/out-of-lens):
+  #   body +x (forward) → cam +y (image up)        ← image up = forward, standard for downward cams
+  #   body +y (right)   → cam +x (image right)
+  #   body +z (down)    → cam -z (lens points body +z = down)
+  # t = +0.05 m along body +z places the lens 5 cm below the body origin.
+  # Real calibration TODO once we have measurements; this is the right
+  # *shape* of the extrinsic for a body-mounted nadir camera.
+  - { src: cam_body, dst: cam_downward, type: se3_inline,
+      R: [[0, 1, 0], [1, 0, 0], [0, 0, -1]],
+      t: [0.0, 0.0, 0.05] }
+
+# Pre-extracted object point clouds for visualization / debugging. Each entry
+# is loaded by `falsify.visualization.read_ply` and passed through the
+# FrameGraph by `falsify.cli.visualize_frames`, so a single misaligned-by-frame
+# bug shows up as the gate floating away from the trajectory in one of the
+# rendered PLYs. `color` is an RGB triplet (0–1) used by the visualizer to
+# override the file's stored colors so the object stays visible against the
+# trajectory.
+scene_objects:
+  - { name: gate,  ply: ../../data/gate_scenes_export/objects_final/left_gate.ply,  frame: mocap, color: [0.72, 0.32, 0.32] }
+  - { name: table, ply: ../../data/gate_scenes_export/objects_final/left_table.ply, frame: mocap, color: [0.55, 0.45, 0.30] }
+
+# Published gate-region metadata. Consumed by:
+#   - GateRigidPerturbation (per-episode random offsets in xyz / yaw)
+#   - static scene_edits (center_gate's move_gate uses these same numbers)
+# Numbers come from data/gate_scenes_export/objects_final/objects_summary.json
+# (left_gate AABB tightened to objects_summary; widened by ~0.15 m in xy in
+# `target_aabb_min/max` for the static edit so we catch the gate's fuzzy
+# outer Gaussians — see center_gate.yaml). The include / exclude lists keep
+# the gate Gaussians cleanly separated from the table when we widen.
+gate_region:
+  aabb_frame: mocap
+  aabb_min: [0.36, 0.12, 0.05]
+  aabb_max: [1.36, 1.27, 2.05]
+  anchor:   [0.861, 0.694, 0.075]     # current xy-center, floor z
+  normal:   [0.749, 0.663, 0.0]       # current gate-plane normal (xy)
+  include_aabbs:
+    - { min: [1.175, 0.246, 0.054], max: [1.219, 0.319, 0.689] }
+  exclude_aabbs:
+    - { min: [1.20, -0.85, 0.02], max: [1.85, 0.40, 0.62] }   # the table
+  applies_to_scene_objects: [gate]
+
+# Obstacles the perturbation sampler must avoid pushing the gate into.
+# AABBs in MOCAP — same authoritative source as gate_region (objects_summary.json).
+# `GateRigidPerturbation` rejection-samples until the perturbed gate AABB
+# doesn't grow its overlap with any obstacle beyond `max_overlap_growth_factor`
+# (default 1.5) times nominal.
+obstacles:
+  - name: table
+    aabb_frame: mocap
+    aabb_min: [1.20, -0.83, 0.05]
+    aabb_max: [1.85,  0.40, 0.60]

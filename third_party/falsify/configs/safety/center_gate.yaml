@@ -1,0 +1,58 @@
+# Safety criteria for a center_gate VLA rollout.
+#
+# Stop conditions:
+#   - drone leaves the working volume   (BoundsCriterion, mocap-frame box)
+#   - velocity > 10 m/s                 (VelocityCriterion)
+#   - tilt   > 1.2 rad                  (TiltCriterion, ≈ 69°)
+#   - OBB intersects the gate or table  (PointCloudCollisionCriterion)
+#   - crossing the gate plane outside the aperture rectangle (MissGateCriterion)
+#
+# The miss_gate corners below were derived by transporting the left_gate
+# aperture (from configs/falsification/smoke_collision.yaml) through the
+# center_gate scene's `scene_edits` rigid transform via
+# `apply_edits_to_scene_object`. The transform takes the left-gate posts
+# from (≈ (0.65, 1.05) and (1.18, 0.45) in MOCAP-xy, normal (0.749, 0.663))
+# to the new center anchor (2.5, -0.25) with normal (0, -1, 0).
+
+bounds_frame: mocap
+bounds_lower: [-1.0, -3.0, 0.2]
+bounds_upper: [ 4.0,  3.0, 3.0]
+max_speed: 10.0
+max_tilt_rad: 1.2
+
+# ~quadcopter footprint — 35×35×15 cm (half-extents in body FRD).
+drone_body:
+  half_extents: [0.175, 0.175, 0.075]
+
+collision:
+  enabled: true
+  gate_objects:  [gate]    # PLY name from configs/scenes/center_gate.yaml::scene_objects
+  other_objects: [table]
+
+# CENTER gate aperture corners (MOCAP). Drone approaches from +y (start
+# at y=0) → -y (gate plane at y≈-0.328). Corners trace the rectangle so
+# corners[1]-corners[0] (the "u" edge) is the post-to-post span at low z,
+# and corners[3]-corners[0] (the "v" edge) is the vertical span at post-A.
+miss_gate:
+  corners_frame: mocap
+  corners:  # re-measured 2026-09-25 from the gate cloud: posts' inner edges, top bar's underside
+    - [3.17, -0.26, 0.125]   # post-A, bottom
+    - [2.299, -0.259, 0.125]   # post-B, bottom
+    - [2.299, -0.259, 1.821]   # post-B, top
+    - [3.17, -0.26, 1.821]   # post-A, top
+  margin_m: 0.0
+  # See configs/safety/left_gate.yaml for the meaning of these fields.
+  goal_position: [1.525, -0.615, 1.0]
+  # Box tolerance (preferred when set): drone must lie inside the
+  # axis-aligned box `goal_position ± half_extents` (mocap) for
+  # GOAL_REACHED to fire. Box dims require the drone to fly back from
+  # the gate's far side to the stuffed animal area, not just clear the
+  # aperture — 0.6 m in x/y (drone + a generous footprint margin) and
+  # 1.0 m in z (tolerant of hover-height variation).
+  goal_tolerance_half_extents: [0.3, 0.3, 0.5]
+  # Sphere fallback — only used if `goal_tolerance_half_extents` is unset.
+  # Kept for the legacy mode-(b)/(d) no-progress paths.
+  goal_tolerance_m: 1.50            # see configs/safety/left_gate.yaml
+  min_progress_window_s: 4.0
+  min_progress_m: 0.05
+  eval_stop_mode: true              # see configs/safety/left_gate.yaml

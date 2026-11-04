@@ -1,0 +1,445 @@
+"""Batch rollout client — gate_video_overlay.py restructured for throughput (2026-08-12).
+
+Timing on this box put ~75% of a rollout in video-frame rendering (25 extra 512x384 renders per
+chunk, mp4-only) and ~15% in per-trial process startup (torch+gsplat import, full splat checkpoint
+load). The policy consumes only TWO 224x224 renders per chunk. So:
+
+  - TRIALS trials run inside ONE process; the scene loads once.
+  - VIDEO=0 renders nothing beyond the policy's own observations and writes no mp4 — for 5-trial
+    screens and traj-only batteries. Scores are unaffected (verdicts come from the trajectory).
+    CLAIM-TIER RUNS KEEP VIDEO=1: human review is part of strict success.
+  - VIDEO=1 renders every VIDFRAME_STRIDE-th step (default 4, was 2) at FPS (default 9, was 18):
+    same full-length playback, half the frames — after review, lower review fps is fine.
+
+The OBSERVATION path is byte-identical to gate_video_overlay.py and must stay that way: forward cam
+(Tbc_f, native K) + DOWNWARD wrist cam (Tbc_d, downward K) each 1024x768 -> 256 -> 224, strut overlay
+composited on the wrist view after the 256 squash. Any change there is a train/serve mismatch.
+
+Env: PORT, OUT (template with {t}), TRAJ (template with {t}), TRIALS, SIDE, SCENE, NCH, APC, PROMPT,
+START, STARTYAW, VIDEO, VIDFRAME_STRIDE, FPS, COMPOSE, COMPOSE_MID, COMPOSE_MID_CHUNKS.
+"""
+import torch,numpy as np,os
+import paths  # noqa: E402  (repo-relative locations, env-overridable)
+from gsplat import rasterization
+from openpi_client.websocket_client_policy import WebsocketClientPolicy
+import imageio.v2 as iio
+from PIL import Image, ImageDraw
+NCH=int(os.environ.get("NCH","40")); PORT=int(os.environ["PORT"]); OUT=os.environ.get("OUT","")
+SIDE=os.environ.get("SIDE","left"); SCENE=os.environ.get("SCENE","left"); TRAJ=os.environ.get("TRAJ",""); DEV="cuda"
+TRIALS=int(os.environ.get("TRIALS","1")); TRIAL0=int(os.environ.get("TRIAL0","1"))   # TRIAL0: first trial index, so a cell can be extended (t11-20) without renumbering
+VIDEO=os.environ.get("VIDEO","1")=="1"
+VSTRIDE=int(os.environ.get("VIDFRAME_STRIDE","4")); FPS=int(os.environ.get("FPS","9"))
+if VIDEO and OUT and "{t}" not in OUT and TRIALS>1: raise SystemExit("OUT needs a {t} placeholder when TRIALS>1")
+if TRAJ and "{t}" not in TRAJ and TRIALS>1: raise SystemExit("TRAJ needs a {t} placeholder when TRIALS>1")
+D=np.diag([1.,-1,-1,1])
+# right_and_center is DEFINED ON THE RIGHT SPLAT (its YAML gsplat_path): selecting the base
+# checkpoint with `SCENE in ("right",)` silently rendered compound-right in the LEFT scene —
+# no right gate at all — which invalidated every compound-right eval before 2026-08-12.
+if SCENE in ("right", "right_and_center"):
+    CK=os.path.join(paths.SPLATS, "right_scene/mocap_outputs/sagesplat_mocap/sagesplat/2026-05-11_144353/nerfstudio_models/step-000029999.ckpt")
+    M=np.array([[0.136708,-0.001053,0.006031,-0.111938],[0.00108,0.13684,-0.000588,0.030456],[-0.006027,0.000635,0.136711,-0.201447],[0,0,0,1.]]); Tw2g=M@D
+    GAABB=(np.array([-0.06,-1.55,0.05]),np.array([1.15,-0.75,2.05])); GANCH=np.array([0.544,-1.147,0.074]); GNRM=np.array([0.385,-0.923,0.])
+else:
+    CK=os.path.join(paths.SPLATS, "left_scene/mocap_outputs/sagesplat_mocap/sagesplat/2026-05-11_153901/nerfstudio_models/step-000029999.ckpt")
+    Tw2g=np.array([[0.12614431661544656,2.138646801849853e-06,-0.00025306576654559085,-0.15671883492487332],[-2.138646801849853e-06,-0.1261265572041315,-0.0021319289354524646,-0.08013551648879384],[-0.00025306576654559085,0.0021319289354524646,-0.12612630156484925,-0.18772133850562778],[0,0,0,1.]])
+    GAABB=(np.array([0.36,0.12,0.05]),np.array([1.36,1.27,2.05])); GANCH=np.array([0.861,0.694,0.075]); GNRM=np.array([0.749,0.663,0.])
+GNRM=GNRM/np.linalg.norm(GNRM)
+if SCENE=="center":
+    GAABB=(np.array([2.25,-0.69,0.05]),np.array([3.25,0.19,2.05]))
+    GANCH=np.array([2.756,-0.3275,0.125]); GNRM=np.array([0.,-1.,0.])
+sd=torch.load(CK,map_location=DEV,weights_only=False)["pipeline"]
+def gg(n):
+    for p in ("_model.gauss_params.","_model."):
+        if p+n in sd: return sd[p+n].to(DEV)
+means=gg("means");quats=gg("quats");scales=torch.exp(gg("scales"));opac=torch.sigmoid(gg("opacities")).squeeze(-1)
+colors=torch.cat([gg("features_dc")[:,None,:],gg("features_rest")],1); bg=torch.tensor([0.149,0.1647,0.2157],device=DEV)
+if SCENE=="center":
+    import sys as _sys, os as _os
+    _sys.path.insert(0,_os.path.dirname(_os.path.abspath(__file__)))
+    from gsplat_scene_edit import apply_move_gate as _amg
+    means,quats,_nmoved=_amg(means,quats,Tw2g)
+    print(f"[scene] center edit applied: {_nmoved} gaussians moved",flush=True)
+elif SCENE in ("left_and_center","right_and_center"):
+    import sys as _sys, os as _os
+    _sys.path.insert(0,_os.path.dirname(_os.path.abspath(__file__)))
+    from gsplat_scene_edit import apply_duplicate_gate as _adg
+    means,quats,scales,opac,colors,_ncopy=_adg(means,quats,scales,opac,colors,Tw2g,SCENE)
+    print(f"[scene] {SCENE}: {_ncopy} gaussians duplicated to center",flush=True)
+GATE_TF=os.environ.get("GATE_TF","")
+if GATE_TF:
+    import math as _m
+    _gy,_gx,_gyy=[float(v) for v in GATE_TF.split(",")]
+    from gsplat_scene_edit import apply_arbitrary_gate as _aag
+    means,quats,_gcen,_ngm=_aag(means,quats,Tw2g,
+        "right_and_center" if SIDE=="right" else "left_and_center",
+        _m.radians(_gy),(_gx,_gyy))
+    print(f"[scene] arbitrary gate move: yaw {_gy} deg, dxy ({_gx},{_gyy}), {_ngm} gaussians",flush=True)
+
+COMPOSE=os.environ.get("COMPOSE","")
+COMPOSE_MID=os.environ.get("COMPOSE_MID","")
+COMPOSE_MID_CHUNKS=int(os.environ.get("COMPOSE_MID_CHUNKS","2"))
+Wv,Hv=512,384; sx,sy=Wv/1024.,Hv/768.
+Kp=np.array([[502.2632*sx,0,506.3971*sx],[0,500.6736*sy,385.41*sy],[0,0,1.]])
+Kv=torch.tensor(Kp,device=DEV,dtype=torch.float32)[None]
+Kf=torch.tensor([[502.2632,0.,506.3971],[0.,500.6736,385.41],[0.,0.,1.]],device=DEV)[None].float()
+Kd=torch.tensor([[478.2450,0.,511.9041],[0.,476.7944,383.5003],[0.,0.,1.]],device=DEV)[None].float()
+Tbc_f=np.array([[0,0,-1,0.10],[1,0,0,-0.03],[0,-1,0,-0.01],[0,0,0,1.]])
+Tbc_d=np.array([[0,1,0,0.0],[1,0,0,0.0],[0,0,-1,0.05],[0,0,0,1.]])
+_ov=np.asarray(Image.open(os.path.join(paths.FALSIFY, "configs/embodiments/assets/wrist_overlay_pinhole_rgb.png")).convert("RGBA").resize((256,256),Image.BILINEAR),np.uint8)  # hard-fail if missing: a silent None here would strip the strut from the wrist view
+def Rz(p):c,s=np.cos(p),np.sin(p);return np.array([[c,-s,0],[s,c,0],[0,0,1.]])
+def vm(pos,yaw,Tbc):
+    pn=np.array([pos[0],-pos[1],-pos[2]]);T=np.eye(4);T[:3,:3]=Rz(yaw);T[:3,3]=pn
+    c2w=Tw2g@(T@Tbc);R=c2w[:3,:3]*np.array([1,-1,-1]);Ri=R.T;ti=-Ri@c2w[:3,3]
+    V=np.eye(4);V[:3,:3]=Ri;V[:3,3]=ti;return V
+@torch.no_grad()
+def rend(pos,yaw,Tbc,Kk,Ww,Hh):
+    V=torch.tensor(vm(pos,yaw,Tbc),device=DEV,dtype=torch.float32)[None]
+    r,a,_=rasterization(means=means,quats=quats,scales=scales,opacities=opac,colors=colors,viewmats=V,Ks=Kk,width=Ww,height=Hh,packed=False,near_plane=0.001,far_plane=1e10,render_mode="RGB",sh_degree=3,rasterize_mode="classic")
+    return ((r[...,:3]+(1-a)*bg).clamp(0,1).squeeze(0)*255).byte().cpu().numpy()
+def to256(a): return np.asarray(Image.fromarray(a).resize((256,256),Image.BILINEAR),np.uint8)
+def ov(x):
+    rgb=_ov[...,:3].astype(np.float32);al=_ov[...,3:4].astype(np.float32)/255.;return (al*rgb+(1-al)*x.astype(np.float32)).clip(0,255).astype(np.uint8)
+def obs_fwd(pos,yaw): return np.asarray(Image.fromarray(to256(rend(pos,yaw,Tbc_f,Kf,1024,768))).resize((224,224),Image.BICUBIC),np.uint8)
+def obs_wrist(pos,yaw): return np.asarray(Image.fromarray(ov(to256(rend(pos,yaw,Tbc_d,Kd,1024,768)))).resize((224,224),Image.BICUBIC),np.uint8)
+D3=np.diag([1.,-1,-1])
+def to_ns(p): q=Tw2g@np.array([*(D3@p),1.0]); return q[:3]
+def proj(p_ns,V):
+    pc=V[:3,:3]@p_ns+V[:3,3]; z=float(pc[2])
+    if z<=0.05: return None
+    return (Kp[0,0]*pc[0]/z+Kp[0,2], Kp[1,1]*pc[1]/z+Kp[1,2], z)
+def draw_overlay(frame,fut_world,V):
+    im=Image.fromarray(frame).convert("RGB"); dr=ImageDraw.Draw(im,"RGBA")
+    pts=[proj(to_ns(p),V) for p in fut_world]
+    vis=[pt for pt in pts if pt]
+    for i in range(len(vis)-1):
+        (u0,v0,_),(u1,v1,_)=vis[i],vis[i+1]; f=i/max(1,len(vis)-1)
+        col=(int(60+40*f),255,int(120+120*f),235)
+        dr.line([(u0,v0),(u1,v1)],fill=col,width=5)
+    for i,(u,v,_) in enumerate(vis[::3]):
+        dr.ellipse([u-3,v-3,u+3,v+3],fill=(80,255,160,220))
+    if len(vis)>=2:
+        (u1,v1,_),(u0,v0,_)=vis[-1],vis[-2]; import math
+        ang=math.atan2(v1-v0,u1-u0); L=16
+        for da in (2.6,-2.6):
+            dr.line([(u1,v1),(u1+L*math.cos(ang+da),v1+L*math.sin(ang+da))],fill=(255,240,80,255),width=5)
+        dr.ellipse([u1-6,v1-6,u1+6,v1+6],fill=(255,240,80,255))
+    dr.text((10,10),"pin intends -->",fill=(255,255,255,235))
+    return np.asarray(im,np.uint8)
+
+def draw_plans(frame,V,proposed=None,commanded=None):
+    """Draw the coarse plan the POLICY proposed (amber) and the one the reviewer put in its place
+    (cyan), both from the pose the decision was made at, projected into the current camera."""
+    im=Image.fromarray(frame).convert("RGB"); dr=ImageDraw.Draw(im,"RGBA")
+    def poly(path,col,lab,ly):
+        pts=[proj(to_ns(p),V) for p in path]; vis=[q for q in pts if q]
+        for i in range(len(vis)-1):
+            (u0,v0,_),(u1,v1,_)=vis[i],vis[i+1]; dr.line([(u0,v0),(u1,v1)],fill=col,width=4)
+        if vis:
+            u,v,_=vis[-1]; dr.ellipse([u-5,v-5,u+5,v+5],fill=col)
+        dr.rectangle([10,ly,26,ly+6],fill=col); dr.text((32,ly-5),lab,fill=(255,255,255,240))
+    if proposed is not None and commanded is not None:
+        poly(proposed,(250,180,70,235),"the policy asked for this",30)
+        poly(commanded,(90,220,255,255),"the reviewer asked for this instead",48)
+    elif commanded is not None:
+        poly(commanded,(120,235,160,235),"approved as proposed",30)
+    return np.asarray(im,np.uint8)
+
+def draw_inset(frame,pos,proposed=None,commanded=None,S=170,half=2.6):
+    """Top-down inset of the two plans from the decision pose: always visible, even once the camera has
+    turned away from them. Room frame drawn the way the author reads it: +x UP, +y RIGHT (2026-09-20);
+    the square is 2 x `half` metres across."""
+    im=Image.fromarray(frame).convert("RGB"); W=im.size[0]; dr=ImageDraw.Draw(im,"RGBA")
+    x0,y0=W-S-8,8
+    dr.rectangle([x0,y0,x0+S,y0+S],fill=(12,14,18,205),outline=(90,98,112,255))
+    P=lambda p:(x0+S/2-(p[1]-pos[1])/half*(S/2), y0+S/2-(p[0]-pos[0])/half*(S/2))
+    for g in range(1,3):
+        r=g/3*(S/2); dr.ellipse([x0+S/2-r,y0+S/2-r,x0+S/2+r,y0+S/2+r],outline=(58,64,74,255))
+    def poly(path,col):
+        pts=[P(p) for p in path]
+        for i in range(len(pts)-1): dr.line([pts[i],pts[i+1]],fill=col,width=3)
+        if pts: dr.ellipse([pts[-1][0]-4,pts[-1][1]-4,pts[-1][0]+4,pts[-1][1]+4],fill=col)
+    if proposed is not None and commanded is not None:
+        poly(proposed,(250,180,70,240)); poly(commanded,(90,220,255,255))
+    elif commanded is not None:
+        poly(commanded,(120,235,160,240))
+    dr.ellipse([x0+S/2-4,y0+S/2-4,x0+S/2+4,y0+S/2+4],fill=(255,255,255,255))
+    dr.text((x0+S/2-8,y0+4),"+x",fill=(190,198,210,235))
+    dr.text((x0+S-22,y0+S/2-7),"-y",fill=(190,198,210,235)); dr.text((x0+7,y0+S/2-7),"+y",fill=(190,198,210,235))
+    dr.text((x0+7,y0+S-17),f"{half*2:.1f} m across, seen from above",fill=(190,198,210,235))
+    return np.asarray(im,np.uint8)
+
+# wind-kick divergence test (2026-08-28): KICK="step:dx,dy,dz" displaces the drone once
+KICK = os.environ.get("KICK", "")
+if KICK:
+    _ks, _kv = KICK.split(":")
+    KICK_STEP = int(_ks)
+    KICK_VEC = np.array([float(v) for v in _kv.split(",")], np.float32)
+# --- real-in-the-loop retrieval emulator (2026-08-28) ---------------------------------
+REALOBS = os.environ.get("REALOBS", "")
+SIMCMD = os.environ.get("SIMCMD", "0") == "1"
+RETR_MAX = float(os.environ.get("RETR_MAX", "0.35"))
+RETR_MAXYAW = float(os.environ.get("RETR_MAXYAW", "0.7"))
+if REALOBS:
+    _RI = np.load(REALOBS, allow_pickle=True)
+    _RI_pos, _RI_yaw = _RI["pos"], _RI["yaw"]
+    _RI_ep, _RI_t = _RI["ep"], _RI["t"]
+    _RI_dir = str(_RI["data_dir"])
+    _RI_cache = {}
+    _RI_stats = {"hit": 0, "miss": 0, "dists": []}
+    def _retrieve(pos, yaw_state):
+        dp = np.linalg.norm(_RI_pos - pos, axis=1)
+        dy = np.abs(np.angle(np.exp(1j * (_RI_yaw - yaw_state))))
+        score = dp + 0.3 * dy
+        j = int(np.argmin(score))
+        if dp[j] > RETR_MAX or dy[j] > RETR_MAXYAW:
+            _RI_stats["miss"] += 1
+            return None
+        e, t = int(_RI_ep[j]), int(_RI_t[j])
+        if e not in _RI_cache:
+            if len(_RI_cache) > 3:
+                _RI_cache.pop(next(iter(_RI_cache)))
+            _RI_cache[e] = np.load(f"{_RI_dir}/ep_{e:04d}.npz", allow_pickle=True)
+        d = _RI_cache[e]
+        _RI_stats["hit"] += 1; _RI_stats["dists"].append(float(dp[j]))
+        _rz = lambda im: np.asarray(Image.fromarray(np.asarray(im)).resize((224, 224), Image.BICUBIC), np.uint8)
+        return _rz(d["image"][t]), _rz(d["wrist"][t])
+# --------------------------------------------------------------------------------------
+BASE_PROMPT=os.environ.get("PROMPT") or "go through the gate on the %s and hover over the stuffed animal"%SIDE
+_st=[float(v) for v in os.environ.get("START","0,0,1.5").split(",")]
+pol=WebsocketClientPolicy(host="127.0.0.1",port=PORT)
+apc=int(os.environ.get("APC","8"))
+# --- agent in the loop (2026-09-20) -------------------------------------------------------------
+# AGENT_DIR turns each replan into a review: the policy's own command is decoded and written to
+# AGENT_DIR/latest.json with the frames, the client blocks until AGENT_DIR/cmd.json answers
+# {"verdict":"approve"|"override", "why": "...", "move": {...}}, and an override is re-queried through
+# the server's agent mode so the flow executes the reviewer's command instead. The reviewer's words are
+# burned into the video.
+AGENT_DIR=os.environ.get("AGENT_DIR","")
+AGENT_TIMEOUT=float(os.environ.get("AGENT_TIMEOUT","1800"))
+if AGENT_DIR:
+    import json as _json, time as _time
+    for _sub in ("obs","cmds"): os.makedirs(os.path.join(AGENT_DIR,_sub),exist_ok=True)
+    _U=np.load(os.environ.get("SNMVP_PIN_U",f"{os.path.dirname(os.path.abspath(__file__))}/pin_U_mh16.npy")).astype(np.float32)
+    _ns=_json.load(open(paths.NORM_STATS))["norm_stats"]["actions"]
+    _AM=np.array(_ns["mean"][:4],np.float32); _AS=np.array(_ns["std"][:4],np.float32)
+    def _decode(c):
+        ch=(_U@np.asarray(c,np.float32)).reshape(50,32)[:,:4]*( _AS+1e-6)+_AM
+        return np.cumsum(ch[:,:3],0), float(np.degrees(ch[:,3].sum()))
+    _agent_hist=[]; _last_strip=[None]; _exec_holder=[None]
+    def _ask(k,trial,pos,yaw,imf,imw,c,sig):
+        # The policy's command always describes 5 s of motion, but only the first `apc` steps execute
+        # before the reviewer is asked again. Report the part that will actually happen (2026-09-21).
+        d=np.asarray(c,np.float32); path,dyaw=_decode(d)
+        _e=min(apc,len(path))-1; net=path[_e]; dyaw=dyaw*(_e+1)/len(path)
+        # Two panels at 320 px, forward on the left and downward on the right. No drawn labels: the
+        # reviewer is told which is which in words (2026-09-20), and the pixels are better spent
+        # on the views. The 224 px thumbnails this replaced were too small to judge an opening.
+        # ONE image per decision (2026-09-20): the current forward and downward views on top, the
+        # filmstrip of the move just executed underneath. Two Reads per decision became one, which is the
+        # cheapest latency saving available -- every round trip is serial in the reviewer's loop.
+        # Speed first (2026-09-21): one SMALL image per decision -- the two current views at their
+        # native 224 px, ~30 kB. The filmstrip is appended only when the move just executed was long
+        # enough to hide something (AGENT_STRIP_M, default 0.6 m); with short chunks it is rarely needed,
+        # because consecutive decision frames already show the approach.
+        V=int(os.environ.get("AGENT_VIEW","224"))
+        _ps=None
+        if _last_strip[0] and os.path.exists(_last_strip[0]):
+            _ps=Image.open(_last_strip[0])
+            _sc=min(1.0,(2*V+12)/_ps.size[0]); _ps=_ps.resize((int(_ps.size[0]*_sc),int(_ps.size[1]*_sc)))
+        W=max(6+V+8+V+6,(_ps.size[0]+12) if _ps is not None else 0)
+        H=6+V+6+((_ps.size[1]+8) if _ps is not None else 0)
+        big=Image.new("RGB",(W,H),(18,20,26))
+        big.paste(Image.fromarray(imf).resize((V,V)),(6,6)); big.paste(Image.fromarray(imw).resize((V,V)),(6+V+8,6))
+        if os.environ.get("AGENT_LR_MARKS","1")=="1":
+            # Side marks ON the forward panel (2026-09-21): the mann3 reviewer read a figure 30 deg to
+            # the right as "left of centre" and flew away from it, after a brief that spelled the
+            # convention out in words. "L"/"R" at the panel's bottom corners and a centre tick put the
+            # convention in the pixels the reviewer is actually reading.
+            _dr=ImageDraw.Draw(big); _yb=6+V-13
+            for _t,_x in (("L",10),("R",6+V-14)):
+                _dr.text((_x,_yb),_t,fill=(0,0,0)); _dr.text((_x-1,_yb-1),_t,fill=(255,230,0))
+            _dr.line([(6+V//2,6),(6+V//2,14)],fill=(255,230,0),width=1); _dr.line([(6+V//2,6+V-8),(6+V//2,6+V)],fill=(255,230,0),width=1)
+        if _ps is not None: big.paste(_ps,(6,6+V+6))
+        fp=os.path.join(AGENT_DIR,"obs",f"{k:03d}_view.jpg"); big.save(fp,quality=85)
+        _agent_hist.append({"k":k,"x":round(float(pos[0]),2),"y":round(float(pos[1]),2),
+                            "z":round(float(pos[2]),2),"heading_deg":round(float(np.degrees(-yaw)),0)})
+        # the reviewer is shown the SAME yaw convention the move primitives act in (2026-09-20): the
+        # rollout's internal yaw is negated into the state the policy and agent_prompt.move_track use, so
+        # a positive --yaw command now increases the heading it is shown. Before this, the two disagreed
+        # in sign and a reviewer asking to turn right watched the number go left.
+        row={"k":k,"trial":trial,"status":"waiting","pose":[round(float(x),3) for x in (*pos,-yaw)],
+             "view":fp,"proposal":{"net_xyz":[round(float(x),3) for x in net],"net_yaw_deg":round(dyaw,1),
+             "path_end":[round(float(pos[i]+net[i]),3) for i in range(3)],
+             "speed_max_mps":round(float(np.abs(np.diff(path,axis=0)).max()*10),2),"sigma_serve":round(float(sig),2)},
+             "seconds_per_decision":round(apc*0.1,1),"t_asked":_time.time(),
+             "history":_agent_hist[-8:],"during_last_move":_last_strip[0],
+             "last_execution":_exec_holder[0]}
+        tmp=os.path.join(AGENT_DIR,"latest.json.tmp"); _json.dump(row,open(tmp,"w")); os.replace(tmp,os.path.join(AGENT_DIR,"latest.json"))
+        cp=os.path.join(AGENT_DIR,"cmd.json"); t0=_time.time()
+        while _time.time()-t0<AGENT_TIMEOUT:
+            if os.path.exists(cp):
+                try: cmd=_json.load(open(cp))
+                except Exception: _time.sleep(0.05); continue
+                os.replace(cp,os.path.join(AGENT_DIR,"cmds",f"{k:03d}.json"))
+                if int(cmd.get("k",-1))!=k: continue
+                cmd["wait_s"]=round(_time.time()-t0,1); return cmd
+            _time.sleep(0.15)
+        return {"verdict":"approve","why":"(no answer; approved by timeout)"}
+    def _banner(frame,k,text,verdict):
+        im=Image.fromarray(frame); W,_=im.size; pad=Image.new("RGB",(W,170),(14,16,20)); im2=Image.new("RGB",(W,im.size[1]+170))
+        im2.paste(im,(0,0)); im2.paste(pad,(0,im.size[1])); d=ImageDraw.Draw(im2); y0=im.size[1]+7
+        try:
+            from PIL import ImageFont; f=ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",15); fb=ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",15)
+        except Exception: f=fb=None
+        # the task, the arm and the flight tag on every frame (2026-09-22: "label the video with what the task is supposed to be")
+        _tag=os.path.basename(OUT.replace("{t}","")).replace("agent_","").replace(".mp4","") if OUT else ""
+        d.text((10,y0),f"TASK: {BASE_PROMPT}   ·   arm {os.environ.get('ARM','?')}   ·   {_tag}",fill=(200,205,215),font=fb); y0+=20
+        col=(120,220,150) if verdict=="approve" else (250,180,90)
+        d.text((10,y0),f"decision {k}  ·  {verdict.upper()}",fill=col,font=fb)
+        wmax=W-20
+        def _wid(t):
+            try: return d.textlength(t,font=f)
+            except Exception: return 7.5*len(t)
+        words=text.split(); line=""; ly=y0+22
+        for w in words:
+            cand=(line+" "+w).strip()
+            if _wid(cand)>wmax and line:
+                d.text((10,ly),line,fill=(225,230,238),font=f); ly+=19; line=w
+                if ly>y0+118: line=""; break
+            else: line=cand
+        if line: d.text((10,ly),line,fill=(225,230,238),font=f)
+        return np.asarray(im2,np.uint8)
+
+def run_trial(t):
+    PROMPT=BASE_PROMPT
+    pos=np.array(_st[:3]); yaw=float(os.environ.get("STARTYAW","0")); fr=[]
+    executed=0; traj=[np.array([*pos,yaw])]   # x,y,z + rollout yaw per step (2026-09-22; heading = -yaw)
+    _switched=False; _mid_left=0
+    for ci in range(NCH):
+        if COMPOSE and not _switched:
+            sd_=(np.array(traj)[:,:3]-GANCH)@GNRM
+            if len(sd_)>2 and (np.sign(sd_[:-1])!=np.sign(sd_[1:])).any():
+                if COMPOSE_MID:
+                    PROMPT=COMPOSE_MID; _mid_left=COMPOSE_MID_CHUNKS
+                    print(f"[compose] milestone at step {len(traj)}; splicing {COMPOSE_MID_CHUNKS} chunks of intermediate task",flush=True)
+                else:
+                    PROMPT=COMPOSE
+                _switched=True
+        elif _mid_left>0:
+            _mid_left-=1
+            if _mid_left==0:
+                PROMPT=COMPOSE
+                print(f"[compose] splice done at step {len(traj)}; final task",flush=True)
+        imf=obs_fwd(pos,yaw); imw=obs_wrist(pos,yaw)
+        if REALOBS:
+            _r = _retrieve(pos, -yaw)
+            if _r is not None:
+                if SIMCMD:
+                    _cmd_f, _cmd_w = imf, imw
+                imf, imw = _r
+            else:
+                _cmd_f = _cmd_w = None
+        o={"observation/image":imf,"observation/wrist_image":imw,"observation/state":np.array([pos[0],pos[1],pos[2],-yaw,0,0,0],np.float32),"prompt":PROMPT,"progress":min(1.0,executed/271.0)}
+        if REALOBS and SIMCMD and _r is not None:
+            o["snmvp_cmd_image"], o["snmvp_cmd_wrist"] = _cmd_f, _cmd_w
+        o["snmvp_trial"]=f"{SCENE}_{SIDE}_{t}"  # per-trial key: the MDN server's pi-hysteresis latch must not leak across interleaved clients/trials
+        if ci==0: o["reset"]=True
+        _res=pol.infer(o); act=np.asarray(_res["actions"])[:,:7]; n=min(len(act),apc)
+        _think=None; _verd="approve"
+        if AGENT_DIR:
+            _cmd=_ask(ci,o["snmvp_trial"],pos,yaw,imf,imw,_res.get("snmvp_c",np.zeros(16,np.float32)),
+                      float(_res.get("snmvp_sigma_serve",-1.0)))
+            _think=_cmd.get("why","") or ""; _verd=_cmd.get("verdict","approve"); _exec_holder[0]=None
+            if _cmd.get("stop"): break
+            _cprop=np.asarray(_res.get("snmvp_c",np.zeros(16,np.float32)),np.float32)
+            _plan_prop=pos+_decode(_cprop)[0]; _plan_cmd=None
+            if _verd=="override" and _cmd.get("move"):
+                # Adaptive execution length (2026-09-21): an authored move is shaped to complete at
+                # a natural pace (AGENT_SPEED m/s) and we run at most AGENT_MAXEXEC steps of it before
+                # asking again. A short correction finishes and returns control quickly; a long move is
+                # interrupted part way so the reviewer can look before the rest happens. An APPROVAL still
+                # runs the policy's whole 5-second chunk, so agreeing with the policy stays cheap.
+                _mv=_cmd["move"]
+                _d=float(np.hypot(_mv.get("forward",0.0) or 0.0,_mv.get("left",0.0) or 0.0))
+                _spd=float(os.environ.get("AGENT_SPEED","0.45")); _cap=int(os.environ.get("AGENT_MAXEXEC","25"))
+                _nfull=int(np.clip(round(_d/max(_spd,1e-3)*10),10,apc))
+                o2=dict(o); o2["snmvp_agent"]={"move":_mv,"say":_think,"k":ci,"apc":_nfull}
+                _res=pol.infer(o2); act=np.asarray(_res["actions"])[:,:7]
+                n=int(min(len(act),_nfull,_cap))
+                _exec_holder[0]=(f"your move needed {_nfull} steps ({_nfull*0.1:.1f} s); {n} of them ran "
+                                 f"({100*n/max(_nfull,1):.0f} % of the movement) before this decision"
+                                 if n<_nfull else
+                                 f"your move ran in full ({n} steps, {n*0.1:.1f} s)")
+                _plan_cmd=pos+_decode(np.asarray(_res.get("snmvp_c",_cprop),np.float32))[0]
+            print(f"[agent] {ci}: {_verd} ({_cmd.get('wait_s','?')}s) :: {_think[:110]}",flush=True)
+        if KICK and executed <= KICK_STEP < executed + n:
+            pos = pos + KICK_VEC
+            print(f"[kick] applied {KICK_VEC.tolist()} at step {executed}",flush=True)
+        cs_all=np.cumsum(act[:,:3],0); cs=cs_all[:n]
+        if VIDEO:
+            for i in range(0,n,VSTRIDE):
+                wp=pos+cs[i]; wy=yaw-float(act[:i+1,3].sum())
+                frame=rend(wp,wy,Tbc_f,Kv,Wv,Hv)
+                _V=vm(wp,wy,Tbc_f)
+                frame=draw_overlay(frame, pos+cs_all[i:], _V)
+                if AGENT_DIR and _think is not None:
+                    _a=_plan_prop if _plan_cmd is not None else None
+                    _b=_plan_cmd if _plan_cmd is not None else _plan_prop
+                    frame=draw_plans(frame,_V,_a,_b)
+                    frame=draw_inset(frame,pos,_a,_b)
+                    frame=_banner(frame,ci,_think,_verd)
+                fr.append(frame)
+        if AGENT_DIR:
+            # The reviewer sees one frame per 5-second chunk, so everything that happens DURING a move --
+            # including the gate transit itself -- is invisible to it (2026-09-20). Five forward
+            # views spaced through the chunk just executed are handed to it with the next decision.
+            # Render a dozen views through the chunk and keep the ones that actually show something new
+            # (2026-09-20): near-duplicate frames waste the reviewer's attention, while a fast
+            # stretch deserves more of them. First and last are always kept; up to 8 in time order.
+            _moved=float(np.linalg.norm(cs[n-1]))
+            _cand=[] if _moved<float(os.environ.get("AGENT_STRIP_M","0.6")) else [int(round(f*(n-1))) for f in np.linspace(0,1,8)]
+            _ims=[]
+            if not _cand: _last_strip[0]=None
+            for _i in _cand:
+                _wp=pos+cs[_i]; _wy=yaw-float(act[:_i+1,3].sum())
+                _ims.append(np.asarray(obs_fwd(_wp,_wy),np.float32))
+            _thumb=[im.reshape(28,8,28,8,3).mean(axis=(1,3)).mean(axis=2) for im in _ims] if _ims else []
+            if _ims:
+                _keep=[0]; _last=_thumb[0]
+                for _i in range(1,len(_ims)-1):
+                    if float(np.abs(_thumb[_i]-_last).mean())>14.0 and len(_keep)<4:
+                        _keep.append(_i); _last=_thumb[_i]
+                _keep.append(len(_ims)-1)
+                _F=112
+                _sf=[Image.fromarray(_ims[_i].astype(np.uint8)).resize((_F,_F)) for _i in _keep]
+                _strip=Image.new("RGB",(len(_sf)*_F+(len(_sf)+1)*4,_F+8),(18,20,26))
+                for _j,_im in enumerate(_sf): _strip.paste(_im,(4+_j*(_F+4),4))
+                _sp=os.path.join(AGENT_DIR,"obs",f"{ci:03d}_during.jpg"); _strip.save(_sp,quality=88)
+                _last_strip[0]=_sp
+        for i in range(n): traj.append(np.array([*(pos+cs[i]),yaw-float(act[:i+1,3].sum())]))
+        pos=pos+cs[-1]; yaw=yaw-float(act[:n,3].sum()); executed+=n
+        if abs(pos[0])>60 or abs(pos[1])>60: break
+    out=OUT.replace("{t}",str(t)) if OUT else ""
+    if VIDEO and fr and out: iio.mimsave(out,fr,fps=FPS,codec="libx264",quality=6)
+    P4=np.array(traj); P=P4[:,:3]; sd_=(P-GANCH)@GNRM; inb=int(np.all((P>=GAABB[0])&(P<=GAABB[1]),axis=1).sum())
+    cr=np.where(np.sign(sd_[:-1])!=np.sign(sd_[1:]))[0]; thru=False; cf=None
+    for i in cr:
+        tt=sd_[i]/(sd_[i]-sd_[i+1]+1e-9); X=P[i]+tt*(P[i+1]-P[i])
+        if GAABB[0][0]<=X[0]<=GAABB[1][0] and GAABB[0][2]<=X[2]<=GAABB[1][2] and not thru: thru=True; cf=(round(float(X[0]),2),round(float(X[1]),2),round(float(X[2]),2))
+    if TRAJ: np.save(TRAJ.replace("{t}",str(t)),P4)   # 4 columns; every scorer slices [:, :3]
+    print("trial %d: %d frames end x=%.2f y=%.2f z=%.2f | in_aabb=%d THROUGH=%s at %s"%(t,len(fr),pos[0],pos[1],pos[2],inb,thru,cf),flush=True)
+
+for t in range(TRIAL0,TRIAL0+TRIALS):
+    run_trial(t)
+print("BATCH_DONE",flush=True)
+if AGENT_DIR:   # tells a reviewer blocked in --then-wait after the last decision that no next decision is coming
+    open(os.path.join(AGENT_DIR,"done"),"w").write("BATCH_DONE\n")
+
+if REALOBS:
+    import atexit
+    def _ri_report():
+        h, m = _RI_stats["hit"], _RI_stats["miss"]
+        d = _RI_stats["dists"]
+        print(f"[retrieval] hits={h} misses={m} ({m/max(h+m,1):.0%} fallback) "
+              f"dist median {np.median(d) if d else float('nan'):.2f}", flush=True)
+    atexit.register(_ri_report)

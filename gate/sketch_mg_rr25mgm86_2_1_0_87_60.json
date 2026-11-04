@@ -1,0 +1,47 @@
+{
+ "points": [
+  [
+   0.0,
+   0.0,
+   1.5,
+   0.334
+  ],
+  [
+   1.94,
+   0.673,
+   1.45,
+   0.568
+  ],
+  [
+   2.615,
+   1.103,
+   1.45,
+   -1.003
+  ],
+  [
+   3.269,
+   0.076,
+   1.45,
+   -2.574
+  ],
+  [
+   2.173,
+   -0.623,
+   1.45,
+   3.129
+  ],
+  [
+   1.525,
+   -0.615,
+   1.2,
+   3.129
+  ]
+ ],
+ "prompt_after": "go through the gate on the right and hover over the stuffed animal",
+ "enter_radius": 0.5,
+ "step_m": 0.025,
+ "sigma_serve": 0.0,
+ "end_margin_m": 0.1,
+ "carrot": 20,
+ "note": "wider detour around post A (2026-09-25); original in *_narrow.json"
+}
